@@ -25,8 +25,8 @@ def load_data():
     # split data into train and test
     source_x_data, source_y_data = source_data
     target_x_data, target_y_data = target_data
-    source_x_data, source_y_data = skutils.shuffle(source_x_data, source_y_data, random_state=0)
-    target_x_data, target_y_data = skutils.shuffle(target_x_data, target_y_data, random_state=0)
+    # source_x_data, source_y_data = skutils.shuffle(source_x_data, source_y_data, random_state=0)
+    # target_x_data, target_y_data = skutils.shuffle(target_x_data, target_y_data, random_state=0)
 
     # split source data
     source_size = source_x_data.shape[0]
@@ -156,6 +156,21 @@ def label_predictor(features):
     pred_y = utils.scores(outputs[-1], [num_units_lstm, num_labels], [num_labels])
     return pred_y
 
+def domain_predictor(features):
+    features = tf.transpose(features, [1, 0, 2, 3])  # (135, batch_size, 3, 64)
+
+    feat_flat = tf.reshape(features, [-1, channels * num_filter])
+    lstm_inputs = tf.split(feat_flat, num_or_size_splits=final_length, axis=0)
+    with tf.variable_scope("lstm_layers"):
+        lstm_cell_1 = tf.contrib.rnn.BasicLSTMCell(num_units_lstm, forget_bias=1.0, state_is_tuple=True)
+        lstm_cell_1 = tf.contrib.rnn.DropoutWrapper(lstm_cell_1, input_keep_prob=prok, output_keep_prob=prok)
+        lstm_cell_2 = tf.contrib.rnn.BasicLSTMCell(num_units_lstm, forget_bias=1.0, state_is_tuple=True)
+        # lstm_cell_2 = tf.contrib.rnn.DropoutWrapper(lstm_cell_2, input_keep_prob=self.prok, output_keep_prob=self.prok)
+        cells = tf.contrib.rnn.MultiRNNCell([lstm_cell_1, lstm_cell_2], state_is_tuple=True)
+        outputs, _ = tf.contrib.rnn.static_rnn(cells, lstm_inputs, dtype=tf.float32)
+    pred_y = utils.scores(outputs[-1], [num_units_lstm, 2], [2])
+    return pred_y
+
 def _add_layer(x):
     x = tf.reshape(x, [-1, window_length, channels, 1])
     with tf.variable_scope('conv1'):
@@ -202,6 +217,10 @@ def lstm_only(x):
         outputs, _ = tf.contrib.rnn.static_rnn(cells, lstm_inputs, dtype=tf.float32)
     return outputs
 
+def MMD(p, q):
+    # maximum mean discrepancy
+    return tf.pow((tf.reduce_mean(p, axis=1) - tf.reduce_mean(q, axis=1)), 2)
+
 
 def build_model():
     print("...Building model")
@@ -215,6 +234,13 @@ def build_model():
         # all_features = outputs[-1]
     with tf.variable_scope('label_predictor'):
         source_features = tf.slice(all_features, [0, 0, 0, 0], [batch_size/2, -1, -1, -1])
+
+        # mmd loss
+        # target_features = tf.slice(all_features, [batch_size/2, 0, 0, 0], [-1, -1, -1, -1])
+        # source_feat_flat = tf.reshape(source_features, [-1, final_length*channels*num_filter])
+        # target_feat_flat = tf.reshape(target_features, [-1, final_length*channels*num_filter])
+        # mmd_loss = tf.reduce_mean(MMD(source_feat_flat, target_feat_flat))
+        # tf.summary.scalar("mmd", mmd_loss)
         classfier_features = tf.cond(is_train, lambda: source_features, lambda: all_features)
         all_labels = Y
         source_labels = tf.slice(all_labels, [0, 0], [batch_size/2, -1])
@@ -232,21 +258,22 @@ def build_model():
         acc = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
         accuracy_summary = tf.summary.scalar("predict_accuracy", acc)
     with tf.variable_scope('domain_predictor'):
-        all_features_flat = tf.reshape(all_features, [-1, final_length*channels*num_filter])
-        feat = flip_gradient(all_features_flat, sigma)
-        with tf.variable_scope('full1'):
-            d_f1 = utils.full_conn(feat, [final_length*channels*num_filter, 1024], [1024])
-        with tf.variable_scope('full2'):
-            d_f2 = utils.full_conn(d_f1, [1024, 128], [128])
-        with tf.variable_scope('score'):
-            domain_pred_y = utils.scores(d_f2, [128, 2], [2])
+        # all_features_flat = tf.reshape(all_features, [-1, final_length*channels*num_filter])
+        feat = flip_gradient(all_features, sigma)
+        # with tf.variable_scope('full1'):
+        #     d_f1 = utils.full_conn(feat, [final_length*channels*num_filter, 1024], [1024])
+        # with tf.variable_scope('full2'):
+        #     d_f2 = utils.full_conn(d_f1, [1024, 128], [128])
+        # with tf.variable_scope('score'):
+        #     domain_pred_y = utils.scores(d_f2, [128, 2], [2])
+        domain_pred_y = domain_predictor(feat)
         domain_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(
             logits=tf.clip_by_value(domain_pred_y,1e-10,1.0), labels=D_Y))
         tf.summary.scalar('domain_loss', domain_loss)
         domain_correct_pred = tf.equal(tf.argmax(domain_pred_y, 1), tf.argmax(D_Y, 1))
         domain_acc = tf.reduce_mean(tf.cast(domain_correct_pred, tf.float32))
         tf.summary.scalar('domain_accuracy', domain_acc)
-    total_loss = loss + domain_loss
+    total_loss = loss + domain_loss # + mmd_loss
     tf.summary.scalar('total_loss', total_loss)
     regular_train_op = tf.train.MomentumOptimizer(learning_rate, 0.9).minimize(loss)
     dann_train_op = tf.train.MomentumOptimizer(learning_rate, 0.9).minimize(total_loss)
@@ -306,7 +333,10 @@ def train(loss, domain_loss, total_loss, acc, domain_acc, regular_train_op, dann
             if training_mode == 'dann':
 
                 X0, y0 = gen_source_batch.next()
+                X0 = X0 + np.random.normal(size=X0.shape)
                 X1, y1 = gen_target_batch.next()
+                X1 = X1 + np.random.normal(size=X1.shape)
+
                 X_batch = np.vstack([X0, X1])
                 y_batch = np.vstack([y0, y1])
 

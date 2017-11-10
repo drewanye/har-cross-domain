@@ -6,6 +6,8 @@ import matplotlib.pyplot as plt
 import os
 import cPickle as cp
 import utils
+from sklearn import utils as skutils
+
 
 Labels = [
     'StandingUpFS',
@@ -141,6 +143,9 @@ def preprocess_data():
     # data from the young as source domain, data from the old as target domain
     young_y_data = utils.one_hot(young_y_data[:, 0]-1, num_labels)
     old_y_data = utils.one_hot(old_y_data[:, 0]-1, num_labels)
+    # shuffle data
+    young_x_data, young_y_data = skutils.shuffle(young_x_data, young_y_data, random_state=0)
+    old_x_data, old_y_data = skutils.shuffle(old_x_data, old_y_data, random_state=0)
     print("the size of source domain data: {} | the size of target domain data: {}".format(
         young_x_data.shape, old_x_data.shape))
     with open('datasets/all_UbiMiB.cp', 'wb') as f:
