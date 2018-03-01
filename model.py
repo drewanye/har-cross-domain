@@ -1,287 +1,257 @@
 __author__ = 'Zhenan Ye'
 
 import tensorflow as tf
+
 import numpy as np
-import cPickle as cp
 import os
-import utils
+import data_utils
 from flip_gradient import flip_gradient
-import tqdm
-from sklearn import utils as skutils
 import argparse
-from tensorflow.python import debug as tf_debug
-
-datasets_path = 'datasets'
-all_UniMiB_path = os.path.join(datasets_path, 'all_UbiMiB.cp')
+import functools
 
 
-def load_data():
-    print("...Loading data")
-    with open(all_UniMiB_path, 'rb') as f:
-        data = cp.load(f)
-    source_data, target_data = data
-    print("...the size of source data: {}, the size of target data: {}".format(
-        source_data[0].shape, target_data[0].shape))
-    # split data into train and test
-    source_x_data, source_y_data = source_data
-    target_x_data, target_y_data = target_data
-    # source_x_data, source_y_data = skutils.shuffle(source_x_data, source_y_data, random_state=0)
-    # target_x_data, target_y_data = skutils.shuffle(target_x_data, target_y_data, random_state=0)
+slim = tf.contrib.slim
 
-    # split source data
-    source_size = source_x_data.shape[0]
-    source_train_size = int(source_size * 0.7)
-    source_x_train = source_x_data[:source_train_size]
-    source_y_train = source_y_data[:source_train_size]
-    source_x_test = source_x_data[source_train_size:]
-    source_y_test = source_y_data[source_train_size:]
-    print(" ...source train size: {}, source test size: {}".format(
-        source_x_train.shape, source_x_test.shape))
+# # model params for UniMiB
+# channels = 3
+# cut_channels = channels
+# window_length = 151
+# num_classes = 17
+# num_domain_labels = 2
+# # feature_extractor 27, residual_feat_extractor 16,26
+# final_length = 26
+# kernel_sizes = [[2, 1], [3, 1]]
+# strides = [[2, 1], [3, 1]]
 
-    # split target data
-    target_size = target_x_data.shape[0]
-    target_train_size = int(target_size * 0.7)
-    target_x_train = target_x_data[:target_train_size]
-    target_y_train = target_y_data[:target_train_size]
-    target_x_test = target_x_data[target_train_size:]
-    target_y_test = target_y_data[target_train_size:]
-    print(" ...target train size: {}, target test size: {}".format(
-        target_x_train.shape, target_x_test.shape))
+# # model params for Realistics
+# channels = 117
+# window_length = 300
+# num_classes = 33
+# num_domain_labels = 2
+# final_length = 50
+# cut_channels = 20
+# kernel_sizes = [[2, 2], [3, 3]]
+# strides = [[2, 2], [3, 3]]
 
-    return (source_x_train, source_y_train), (source_x_test, source_y_test),\
-           (target_x_train, target_y_train), (target_x_test, target_y_test)
+# # model params for RealWorld cross_subject
+# channels = 63
+# window_length = 300
+# num_classes = 8
+# num_domain_labels = 2
+# final_length = 50
+# cut_channels = channels
+# kernel_sizes = [[2, 1], [3, 1]]
+# strides = [[2, 1], [3, 1]]
 
-# params
-channels = 3
-batch_size = 100
-window_length = 151
-num_labels = 17
+# model params for RealWorld cross placement
+channels = 9
+window_length = 300
+num_classes = 8
 num_domain_labels = 2
-filter_size = 5
+final_length = 50
+cut_channels = channels
+kernel_sizes = [[2, 1], [3, 1]]
+strides = [[2, 1], [3, 1]]
+
+# model params for Opportunity
+# channels = 113
+# window_length = 24
+# num_classes = 17
+# num_domain_labels = 2
+# final_length = 6
+# cut_channels = channels
+# kernel_sizes = [[2, 1], [2, 1]]
+# strides = [[2, 1], [2, 1]]
+
+# train params
+batch_size = 32
 num_filter = 64
-# feature_extractor 27, residual_feat_extractor 16,26
-final_length = 26
 num_units_lstm = 128
-num_steps = 10000
+num_steps = 20000
+summary_step = 200
+checkpoint_step = 200
+start_learning_rate = 0.0003
+lr_decay_steps = 500
+lr_decay_rate = 0.95
 
-X = tf.placeholder(shape=[None, window_length, channels], dtype=tf.float32)
-Y = tf.placeholder(shape=[None, num_labels], dtype=tf.float32)
-D_Y = tf.placeholder(shape=[None, num_domain_labels], dtype=tf.float32)
-prok = tf.placeholder(dtype=tf.float32)
-learning_rate = tf.placeholder(dtype=tf.float32)
-is_train = tf.placeholder(dtype=tf.bool)
-sigma = tf.placeholder(dtype=tf.float32)
+# leakiness = 0.1
+# start_learning_rate = 0.001
+# lr_decay_steps = 500
+# lr_decay_rate = 0.95
+# leaky_relu = functools.partial(data_utils.lrelu, leakiness=leakiness)
 
+def create_placeholder():
+    X = tf.placeholder(shape=[None, window_length, channels], dtype=tf.float32)
+    Y = tf.placeholder(shape=[None, num_classes], dtype=tf.float32)
+    D_Y = tf.placeholder(shape=[None, num_domain_labels], dtype=tf.float32)
+    prok = tf.placeholder(dtype=tf.float32)
+    is_train = tf.placeholder(dtype=tf.bool)
+    sigma = tf.placeholder(dtype=tf.float32)
+    is_training = tf.placeholder(dtype=tf.bool)
+    return X, Y, D_Y, prok, is_train, sigma, is_training
 
-def residual(x, in_channel, out_channel):
-    """residual unit with 2 layers
-    convolution:
-        width filter: 1
-        height filter: 3
-    """
-    orig_x = x
-    width_filter = 3
-    height_filter = 1
-    with tf.variable_scope('conv1'):
-        conv1 = utils.conv(x, [width_filter, height_filter, in_channel, out_channel], [out_channel], padding='SAME')
-        relu1 = utils.activation(conv1)
-    with tf.variable_scope('conv2'):
-        conv2 = utils.conv(relu1, [width_filter, height_filter, out_channel, out_channel], [out_channel], padding='SAME')
-    with tf.variable_scope('add'):
-        if in_channel != out_channel:
-            orig_x = utils.conv(x, [width_filter, height_filter, in_channel, out_channel], [out_channel], padding='SAME')
+def resnet_block(net, resnet_filters):
+    with slim.arg_scope([slim.conv2d], padding='SAME'):
+        net_in = net
+        net = slim.conv2d(
+            net,
+            resnet_filters,
+            stride=1,
+            normalizer_fn=slim.batch_norm,
+            activation_fn=tf.nn.relu)
+        net = slim.conv2d(
+            net,
+            resnet_filters,
+            stride=1,
+            normalizer_fn=slim.batch_norm,
+            activation_fn=None)
+        if net_in.get_shape()[-1] != resnet_filters:
+            net_in = slim.conv2d(
+                net_in,
+                resnet_filters,
+                stride=1,
+                normalizer_fn=slim.batch_norm,
+                activation_fn=None)
 
-    return utils.activation(conv2 + orig_x)
+        return tf.nn.relu(net + net_in)
 
-def feature_extractor(x):
-    x = tf.reshape(x, [-1, window_length, channels, 1])
-    with tf.variable_scope('conv1'):
-        conv1 = utils.conv(x, [filter_size, 1, 1, num_filter], [num_filter],
-                           padding='VALID')
-        relu1 = utils.activation(conv1)
-    with tf.variable_scope('conv2'):
-        conv2 = utils.conv(relu1, [filter_size, 1, num_filter, num_filter], [num_filter],
-                           padding='VALID')
-        relu2 = utils.activation(conv2)
-    with tf.variable_scope('conv3'):
-        conv3 = utils.conv(relu2, [filter_size, 1, num_filter, num_filter], [num_filter],
-                           padding='VALID')
-        relu3 = utils.activation(conv3)
-    with tf.variable_scope('conv4'):
-        conv4 = utils.conv(relu3, [filter_size, 1, num_filter, num_filter], [num_filter],
-                           padding='VALID')
-        relu4 = utils.activation(conv4)
-    with tf.variable_scope('pool1'):
-        h_pool1 = utils.max_pool(relu4, 5, 1, 5, 1, padding='SAME')
+def CNN_block(net, num_filters, residual=False):
+    with slim.arg_scope([slim.conv2d], padding='SAME'):
+        net_in = net
+        net = slim.conv2d(
+            net,
+            num_filters,
+            stride=1,
+            normalizer_fn=slim.batch_norm,
+            activation_fn=tf.nn.relu)
+        net = slim.conv2d(
+            net,
+            num_filters,
+            stride=1,
+            normalizer_fn=slim.batch_norm,
+            activation_fn=None)
+        net_out = net
+        if residual:
+            if net_in.get_shape()[-1] != num_filters:
+                net_in = slim.conv2d(
+                    net_in,
+                    num_filters,
+                    stride=1,
+                    normalizer_fn=slim.batch_norm,
+                    activation_fn=None)
+            net_out = tf.nn.relu(net + net_in)
 
-    return h_pool1
+        return net_out
 
-def residual_feat_extractor(x):
-    x = tf.reshape(x, [-1, window_length, channels, 1])
-    x_shape = x.get_shape()
-    with tf.variable_scope('residual1'):
-        r1 = residual(x, x_shape[-1], 32)
-        # tf.summary.histogram('res_output1', r1)
-    with tf.variable_scope('residual2'):
-        r2 = residual(r1, r1.get_shape()[-1], 32)
-        # tf.summary.histogram('res_output2', r2)
-
-    with tf.variable_scope('pool0'):
-        h_pool0 = utils.max_pool(r2, 2, 1, 2, 1, padding='SAME')
-
-    with tf.variable_scope('residual3'):
-        r3 = residual(h_pool0, h_pool0.get_shape()[-1], 64)
-        # tf.summary.histogram('res_output3', r3)
-    with tf.variable_scope('residual4'):
-        r4 = residual(r3, r3.get_shape()[-1], 64)
-        # tf.summary.histogram('res_output4', r4)
-
-    with tf.variable_scope('pool1'):
-        h_pool1 = utils.max_pool(r4, 3, 1, 3, 1, padding='SAME')
-    return h_pool1
-
-def label_predictor(features):
-    features = tf.transpose(features, [1, 0, 2, 3])  # (135, batch_size, 3, 64)
-
-    feat_flat = tf.reshape(features, [-1, channels * num_filter])
-
-    lstm_inputs = tf.split(feat_flat, num_or_size_splits=final_length, axis=0)
-    with tf.variable_scope("lstm_layers"):
-        lstm_cell_1 = tf.contrib.rnn.BasicLSTMCell(num_units_lstm, forget_bias=1.0, state_is_tuple=True)
-        lstm_cell_1 = tf.contrib.rnn.DropoutWrapper(lstm_cell_1, input_keep_prob=prok, output_keep_prob=prok)
-        lstm_cell_2 = tf.contrib.rnn.BasicLSTMCell(num_units_lstm, forget_bias=1.0, state_is_tuple=True)
-        # lstm_cell_2 = tf.contrib.rnn.DropoutWrapper(lstm_cell_2, input_keep_prob=self.prok, output_keep_prob=self.prok)
-        cells = tf.contrib.rnn.MultiRNNCell([lstm_cell_1, lstm_cell_2], state_is_tuple=True)
-        outputs, _ = tf.contrib.rnn.static_rnn(cells, lstm_inputs, dtype=tf.float32)
-    pred_y = utils.scores(outputs[-1], [num_units_lstm, num_labels], [num_labels])
-    return pred_y
-
-def domain_predictor(features):
-    features = tf.transpose(features, [1, 0, 2, 3])  # (135, batch_size, 3, 64)
-
-    feat_flat = tf.reshape(features, [-1, channels * num_filter])
-    lstm_inputs = tf.split(feat_flat, num_or_size_splits=final_length, axis=0)
-    with tf.variable_scope("lstm_layers"):
-        lstm_cell_1 = tf.contrib.rnn.BasicLSTMCell(num_units_lstm, forget_bias=1.0, state_is_tuple=True)
-        lstm_cell_1 = tf.contrib.rnn.DropoutWrapper(lstm_cell_1, input_keep_prob=prok, output_keep_prob=prok)
-        lstm_cell_2 = tf.contrib.rnn.BasicLSTMCell(num_units_lstm, forget_bias=1.0, state_is_tuple=True)
-        # lstm_cell_2 = tf.contrib.rnn.DropoutWrapper(lstm_cell_2, input_keep_prob=self.prok, output_keep_prob=self.prok)
-        cells = tf.contrib.rnn.MultiRNNCell([lstm_cell_1, lstm_cell_2], state_is_tuple=True)
-        outputs, _ = tf.contrib.rnn.static_rnn(cells, lstm_inputs, dtype=tf.float32)
-    pred_y = utils.scores(outputs[-1], [num_units_lstm, 2], [2])
-    return pred_y
-
-def _add_layer(x):
-    x = tf.reshape(x, [-1, window_length, channels, 1])
-    with tf.variable_scope('conv1'):
-        conv1 = utils.conv(x, [filter_size, 1, 1, num_filter], [num_filter],
-                           padding='VALID')
-        relu1 = utils.activation(conv1)
-    with tf.variable_scope('conv2'):
-        conv2 = utils.conv(relu1, [filter_size, 1, num_filter, num_filter], [num_filter],
-                           padding='VALID')
-        relu2 = utils.activation(conv2)
-    with tf.variable_scope('conv3'):
-        conv3 = utils.conv(relu2, [filter_size, 1, num_filter, num_filter], [num_filter],
-                           padding='VALID')
-        relu3 = utils.activation(conv3)
-    with tf.variable_scope('conv4'):
-        conv4 = utils.conv(relu3, [filter_size, 1, num_filter, num_filter], [num_filter],
-                           padding='VALID')
-        relu4 = utils.activation(conv4)
-
-    relu4 = tf.transpose(relu4, [1, 0, 2, 3])  # (135, batch_size, 3, 64)
-
-    relu4_flat = tf.reshape(relu4, [-1, channels * num_filter])
-
-    lstm_inputs = tf.split(relu4_flat, num_or_size_splits=final_length, axis=0)
-    with tf.variable_scope("lstm_layers"):
-        lstm_cell_1 = tf.contrib.rnn.BasicLSTMCell(num_units_lstm, forget_bias=1.0, state_is_tuple=True)
-        lstm_cell_1 = tf.contrib.rnn.DropoutWrapper(lstm_cell_1, input_keep_prob=prok, output_keep_prob=prok)
-        lstm_cell_2 = tf.contrib.rnn.BasicLSTMCell(num_units_lstm, forget_bias=1.0, state_is_tuple=True)
-        # lstm_cell_2 = tf.contrib.rnn.DropoutWrapper(lstm_cell_2, input_keep_prob=self.prok, output_keep_prob=self.prok)
-        cells = tf.contrib.rnn.MultiRNNCell([lstm_cell_1, lstm_cell_2], state_is_tuple=True)
-        outputs, _ = tf.contrib.rnn.static_rnn(cells, lstm_inputs, dtype=tf.float32)
-    return outputs
-
-def lstm_only(x):
-    transposed_x = tf.transpose(x, [1, 0, 2])
-    x_flat = tf.reshape(transposed_x, [-1, channels])
-    lstm_inputs = tf.split(x_flat, num_or_size_splits=window_length, axis=0)
-    with tf.variable_scope("lstm_layers"):
-        lstm_cell_1 = tf.contrib.rnn.BasicLSTMCell(num_units_lstm, forget_bias=1.0, state_is_tuple=True)
-        lstm_cell_1 = tf.contrib.rnn.DropoutWrapper(lstm_cell_1, input_keep_prob=prok, output_keep_prob=prok)
-        lstm_cell_2 = tf.contrib.rnn.BasicLSTMCell(num_units_lstm, forget_bias=1.0, state_is_tuple=True)
-        # lstm_cell_2 = tf.contrib.rnn.DropoutWrapper(lstm_cell_2, input_keep_prob=self.prok, output_keep_prob=self.prok)
-        cells = tf.contrib.rnn.MultiRNNCell([lstm_cell_1, lstm_cell_2], state_is_tuple=True)
-        outputs, _ = tf.contrib.rnn.static_rnn(cells, lstm_inputs, dtype=tf.float32)
-    return outputs
-
-def MMD(p, q):
-    # maximum mean discrepancy
-    return tf.pow((tf.reduce_mean(p, axis=1) - tf.reduce_mean(q, axis=1)), 2)
-
-
-def build_model():
-    print("...Building model")
-    x = utils.input_batch_norm(X)
-
-    with tf.variable_scope('feature_extractor'):
-        # outputs = _add_layer(x)
-        # outputs = lstm_only(x)
-        # all_features = feature_extractor(x)
-        all_features = residual_feat_extractor(x)
-        # all_features = outputs[-1]
+def label_predictor(features, is_train, Y, prok):
     with tf.variable_scope('label_predictor'):
-        source_features = tf.slice(all_features, [0, 0, 0, 0], [batch_size/2, -1, -1, -1])
-
-        # mmd loss
-        # target_features = tf.slice(all_features, [batch_size/2, 0, 0, 0], [-1, -1, -1, -1])
-        # source_feat_flat = tf.reshape(source_features, [-1, final_length*channels*num_filter])
-        # target_feat_flat = tf.reshape(target_features, [-1, final_length*channels*num_filter])
-        # mmd_loss = tf.reduce_mean(MMD(source_feat_flat, target_feat_flat))
-        # tf.summary.scalar("mmd", mmd_loss)
-        classfier_features = tf.cond(is_train, lambda: source_features, lambda: all_features)
+        classifier_features = tf.cond(is_train, lambda: tf.slice(features, [0, 0, 0, 0], [batch_size, -1, -1, -1]),
+                                     lambda: features)
         all_labels = Y
-        source_labels = tf.slice(all_labels, [0, 0], [batch_size/2, -1])
-        labels = tf.cond(is_train, lambda: source_labels, lambda: all_labels)
-        pred_y = label_predictor(classfier_features)
-        # with tf.variable_scope("full1"):
-        #     f1 = tf.nn.relu(utils.full_conn(classfier_features, [num_units_lstm, 64], [64]))
-        # with tf.variable_scope('full2'):
-        #     f2 = tf.nn.relu(utils.full_conn(f1, [64, 64], [64]))
-        # with tf.variable_scope('score'):
-        #     pred_y = utils.scores(f2, [64, 17], [17])
-        loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=pred_y, labels=labels))
-        loss_summary = tf.summary.scalar("predict_loss", loss)
-        correct_prediction = tf.equal(tf.argmax(pred_y, 1), tf.argmax(labels, 1))
-        acc = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
-        accuracy_summary = tf.summary.scalar("predict_accuracy", acc)
+        # source_labels = tf.slice(all_labels, [0, 0], [batch_size/2, -1])
+        labels = tf.cond(is_train, lambda: tf.slice(all_labels, [0, 0], [batch_size, -1]), lambda: all_labels)
+        # flatten_features = slim.flatten(features)
+        # with slim.arg_scope([slim.fully_connected], activation_fn=tf.nn.relu):
+        #     f_net1 = slim.fully_connected(flatten_features, 1024, scope='full1')
+        #     f_net2 = slim.fully_connected(f_net1, 128, scope='full2')
+        #     logits = slim.fully_connected(
+        #         f_net2, num_classes, activation_fn=None, scope='fc_logits')
+        classifier_features = tf.transpose(classifier_features, [1, 0, 2, 3])  # (135, batch_size, 3, 64)
+
+        feat_flat = tf.reshape(classifier_features, [-1, cut_channels * num_filter])
+
+        lstm_inputs = tf.split(feat_flat, num_or_size_splits=final_length, axis=0)
+        with tf.variable_scope("lstm_layers"):
+            lstm_cell_1 = tf.contrib.rnn.BasicLSTMCell(num_units_lstm, forget_bias=1.0, state_is_tuple=True)
+            lstm_cell_1 = tf.contrib.rnn.DropoutWrapper(lstm_cell_1, input_keep_prob=prok, output_keep_prob=prok)
+            lstm_cell_2 = tf.contrib.rnn.BasicLSTMCell(num_units_lstm, forget_bias=1.0, state_is_tuple=True)
+            cells = tf.contrib.rnn.MultiRNNCell([lstm_cell_1, lstm_cell_2], state_is_tuple=True)
+            outputs, _ = tf.contrib.rnn.static_rnn(cells, lstm_inputs, dtype=tf.float32)
+            # with slim.arg_scope([slim.fully_connected], activation_fn=tf.nn.relu):
+            #     f_net1 = slim.fully_connected(outputs[-1], 100, scope='full1')
+            #     f_net2 = slim.fully_connected(f_net1, 100, scope='full2')
+
+            logits = slim.fully_connected(
+                outputs[-1], num_classes, activation_fn=None, scope='fc_logits')
+
+    return logits, labels
+
+def domain_predictor(features, sigma):
     with tf.variable_scope('domain_predictor'):
-        # all_features_flat = tf.reshape(all_features, [-1, final_length*channels*num_filter])
-        feat = flip_gradient(all_features, sigma)
-        # with tf.variable_scope('full1'):
-        #     d_f1 = utils.full_conn(feat, [final_length*channels*num_filter, 1024], [1024])
-        # with tf.variable_scope('full2'):
-        #     d_f2 = utils.full_conn(d_f1, [1024, 128], [128])
-        # with tf.variable_scope('score'):
-        #     domain_pred_y = utils.scores(d_f2, [128, 2], [2])
-        domain_pred_y = domain_predictor(feat)
-        domain_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(
-            logits=tf.clip_by_value(domain_pred_y,1e-10,1.0), labels=D_Y))
-        tf.summary.scalar('domain_loss', domain_loss)
-        domain_correct_pred = tf.equal(tf.argmax(domain_pred_y, 1), tf.argmax(D_Y, 1))
-        domain_acc = tf.reduce_mean(tf.cast(domain_correct_pred, tf.float32))
-        tf.summary.scalar('domain_accuracy', domain_acc)
-    total_loss = loss + domain_loss # + mmd_loss
+        features_flat = slim.flatten(features)
+        features_flat = flip_gradient(features_flat, sigma)
+        with slim.arg_scope([slim.fully_connected], activation_fn=tf.nn.relu):
+            f_net1 = slim.fully_connected(features_flat, 1024, scope='full1')
+            f_net2 = slim.fully_connected(f_net1, 128, scope='full2')
+            logits = slim.fully_connected(f_net2, 2, activation_fn=None, scope='fc_logits')
+    return logits
+
+def batch_norm_params(is_training, batch_norm_decay):
+    return {'is_training': is_training,
+            'decay': batch_norm_decay,
+            'epsilon': 0.001}
+
+def loss(label_logits, domain_logits, labels, domain_labels):
+    # label loss
+    label_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=label_logits, labels=labels))
+
+    # domain loss
+    domain_predictions = tf.sigmoid(domain_logits)
+    domain_loss = tf.losses.log_loss(labels=domain_labels, predictions=domain_predictions, weights=1.0)
+    # domain_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(
+    #     logits=tf.clip_by_value(domain_logits, 1e-10, 1.0), labels=domain_labels))
+        # logits=domain_logits, labels=D_Y))
+
+    total_loss = label_loss + domain_loss
+
+    tf.summary.scalar("label_loss", label_loss)
+    tf.summary.scalar('domain_loss', domain_loss)
     tf.summary.scalar('total_loss', total_loss)
-    regular_train_op = tf.train.MomentumOptimizer(learning_rate, 0.9).minimize(loss)
-    dann_train_op = tf.train.MomentumOptimizer(learning_rate, 0.9).minimize(total_loss)
-    tf.summary.scalar('learning_rate', learning_rate)
 
 
-    return loss, domain_loss, total_loss, acc, domain_acc, \
-           regular_train_op, dann_train_op, [loss_summary, accuracy_summary]
+    return label_loss, domain_loss, total_loss
+
+def get_predictions(label_logits, domain_logits, labels, domain_labels):
+    label_prediction = tf.equal(tf.argmax(label_logits, 1), tf.argmax(labels, 1))
+    domain_prediction = tf.equal(tf.argmax(tf.sigmoid(domain_logits), 1), tf.argmax(domain_labels, 1))
+
+    return label_prediction, domain_prediction
+
+def accuracy(label_logits, domain_logits, labels, D_Y):
+    label_predictions = tf.equal(tf.argmax(label_logits, 1), tf.argmax(labels, 1))
+    label_acc = tf.reduce_mean(tf.cast(label_predictions, tf.float32))
+    tf.summary.scalar("label_accuracy", label_acc)
+
+    domain_predictions = tf.equal(tf.argmax(domain_logits, 1), tf.argmax(D_Y, 1))
+    domain_acc = tf.reduce_mean(tf.cast(domain_predictions, tf.float32))
+    tf.summary.scalar('domain_accuracy', domain_acc)
+
+    return label_acc, domain_acc, label_predictions
+
+
+def create_model(x, is_training, is_train, sigma, Y, prok):
+    with tf.variable_scope('dann'):
+        X = tf.expand_dims(x, axis=3)  # batch_size, seq_length, channels, 1
+        with slim.arg_scope([slim.conv2d, slim.fully_connected],
+                            # activation_fn=tf.nn.relu,
+                            normalizer_params=batch_norm_params(is_training, 0.9),
+                            weights_initializer=tf.random_normal_initializer(stddev=0.02),
+                            weights_regularizer=tf.contrib.layers.l2_regularizer(1e-5)):
+            with slim.arg_scope([slim.conv2d], kernel_size=[3, 3]):
+                with slim.arg_scope([slim.max_pool2d], padding='SAME'):
+                    net1 = CNN_block(X, 32, residual=False)
+                    net2 = CNN_block(net1, 32, residual=False)
+                    pool_net1 = slim.max_pool2d(net2, kernel_sizes[0], stride=strides[0], scope='pool1')
+
+                    net3 = CNN_block(pool_net1, 64, residual=False)
+                    net4 = CNN_block(net3, 64, residual=False)
+
+                    all_features = slim.max_pool2d(net4, kernel_sizes[1], stride=strides[1], scope='pool2')
+
+            label_logits, labels = label_predictor(all_features, is_train, Y, prok)
+            domain_logits = domain_predictor(all_features, sigma)
+
+        return label_logits, domain_logits, labels
 
 def batch_generator(data, batch_size):
     train_size = data[0].shape[0]
@@ -298,126 +268,174 @@ def batch_generator(data, batch_size):
             pos = scale
             yield [d[start:scale] for d in data]
 
+def slip_eval(sess, X, Y, is_train, prok, is_training, predictions, test_data, slip_size):
+    test_size = test_data[0].shape[0]
+    start = 0
+    total_preds = np.empty((0))
+    while True:
+        if test_size - start < slip_size:
+            # print("... start {} -> end {}".format(start, test_size))
+            slip_data = [i[start:] for i in test_data]
+            pred = sess.run(predictions, feed_dict={
+                X: slip_data[0], Y: slip_data[1],
+                is_train: False, prok: 1.0, is_training: False})
+            total_preds = np.concatenate((total_preds, pred))
+            break
+        else:
+            end = start+slip_size
+            # print("... start {} -> end {}".format(start, end))
+            slip_data = [j[start:end]for j in test_data]
+            start = end
 
-def train(loss, domain_loss, total_loss, acc, domain_acc, regular_train_op, dann_train_op, selected_summaries, training_mode, version, gpu):
-    print("...Training")
-    source_train, source_test, target_train, target_test = load_data()
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
-    log_path = os.path.join('logs', version)
-    with tf.Session() as sess:
-        merged = tf.summary.merge_all()
-        selected_merged = tf.summary.merge(selected_summaries)
-        train_writer = tf.summary.FileWriter(log_path + '/train',
-                                             sess.graph)
-        test_writer = tf.summary.FileWriter(log_path + '/test')
-        sess.run(tf.global_variables_initializer())
-        gen_source_batch = batch_generator(
-            list(source_train), batch_size / 2)
-        gen_target_batch = batch_generator(
-            list(target_train), batch_size / 2)
-        gen_source_only_batch = batch_generator(
-            list(source_train), batch_size)
-        gen_target_only_batch = batch_generator(
-            list(target_train), batch_size)
-        domain_labels = np.vstack([np.tile([1., 0.], [batch_size / 2, 1]),
-                                   np.tile([0., 1.], [batch_size / 2, 1])])
-        # sess = tf_debug.LocalCLIDebugWrapperSession(sess)
-        for i in tqdm.tqdm(range(num_steps)):
+            pred = sess.run(predictions, feed_dict={
+                    X: slip_data[0], Y: slip_data[1],
+                    is_train: False, prok: 1.0, is_training: False})
+            total_preds = np.concatenate((total_preds, pred))
 
-            # Adaptation param and learning rate schedule as described in the paper
-            p = float(i) / num_steps
-            l = 2. / (1. + np.exp(-10. * p)) - 1
-            lr = 0.01 / (1. + 10 * p) ** 0.75
 
-            # Training step
-            if training_mode == 'dann':
+
+    # if total_preds.shape[0] != test_size:
+    #     raise ValueError("result is not equal to the initial")
+    accuracy = np.mean(total_preds)
+
+    return accuracy
+
+def train(version, gpu, data_path):
+    with tf.Graph().as_default():
+        # create place_holder
+        X, Y, D_Y, prok, is_train, sigma, is_training = create_placeholder()
+        # create model
+        label_logits, domain_logits, labels = create_model(X, is_training, is_train, sigma, Y, prok)
+
+        # define loss
+        label_loss, domain_loss, total_loss = loss(label_logits, domain_logits, labels, D_Y)
+
+        # define accuracy
+        label_acc, domain_acc, label_predictions = accuracy(label_logits, domain_logits, labels, D_Y)
+
+        # train operations
+
+        global_step = slim.get_or_create_global_step()
+        learning_rate = tf.train.exponential_decay(
+            start_learning_rate,
+            global_step,
+            decay_steps=lr_decay_steps,
+            decay_rate=lr_decay_rate,
+            staircase=True)
+        tf.summary.scalar('learning_rate', learning_rate)
+        # optimizer = tf.train.AdamOptimizer(learning_rate)
+        optimizer = tf.train.MomentumOptimizer(learning_rate, 0.9)
+        var_list, update_ops = data_utils.get_vars_and_update_ops('dann')
+        dann_train_op = slim.learning.create_train_op(
+            total_loss,
+            optimizer,
+            update_ops=update_ops,
+            variables_to_train=var_list,
+            clip_gradient_norm=5,
+            summarize_gradients=False)
+
+        source_train, source_test, target_train, target_test = data_utils.load_data(data_path)
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        tf_config = tf.ConfigProto()
+        tf_config.gpu_options.per_process_gpu_memory_fraction = 0.7
+        tf_config.gpu_options.allow_growth = True
+        log_path = os.path.join('logs', version)
+
+        # saver = tf.train.Saver(tf.global_variables(), max_to_keep=10)
+        # saver = tf.train.Saver()
+        saver = tf.train.Saver(tf.global_variables(), max_to_keep=50)
+        train_saved_dir = os.path.join('saved_checkpoint', version)
+
+        with tf.Session(config=tf_config) as sess:
+
+            merged = tf.summary.merge_all()
+            train_writer = tf.summary.FileWriter(log_path + '/train',
+                                                 sess.graph)
+            source_test_writer = tf.summary.FileWriter(log_path + '/source_test')
+            target_test_writer = tf.summary.FileWriter(log_path + '/target_test')
+            sess.run(tf.global_variables_initializer())
+
+            gen_source_batch = batch_generator(
+                source_train, batch_size)
+            gen_target_batch = batch_generator(
+                target_train, batch_size)
+            gen_source_only_batch = batch_generator(
+                source_train, 2*batch_size)
+            gen_target_only_batch = batch_generator(
+                target_train, 2*batch_size)
+            domain_labels = np.vstack([np.tile([1., 0.], [batch_size, 1]),
+                                       np.tile([0., 1.], [batch_size, 1])])
+            # domain_labels_05 = np.tile([0.5, 0.5], [2*batch_size, 1])
+            # sess = tf_debug.LocalCLIDebugWrapperSession(sess)
+            for i in range(num_steps):
+
+                # Adaptation param and learning rate schedule as described in the paper
+                p = float(i) / num_steps
+                l = 2. / (1. + np.exp(-10. * p)) - 1
+                # lr = 0.01 / (1. + 10 * p) ** 0.75
+
+                # Training step
+                #
 
                 X0, y0 = gen_source_batch.next()
-                X0 = X0 + np.random.normal(size=X0.shape)
                 X1, y1 = gen_target_batch.next()
-                X1 = X1 + np.random.normal(size=X1.shape)
 
                 X_batch = np.vstack([X0, X1])
                 y_batch = np.vstack([y0, y1])
 
-                _, batch_loss, dloss, ploss, d_acc, p_acc, summary = \
-                    sess.run([dann_train_op, total_loss, domain_loss, loss, domain_acc, acc, merged],
+                _, batch_loss, dloss, lloss, d_acc, l_acc, summary = \
+                    sess.run([dann_train_op, total_loss, domain_loss, label_loss, domain_acc, label_acc, merged],
                              feed_dict={X: X_batch, Y: y_batch, D_Y: domain_labels,
-                                        is_train: True, sigma: l, learning_rate: lr, prok: 0.7})
+                                        is_train: True, sigma: l, prok: 0.7, is_training: True})
                 train_writer.add_summary(summary, i)
-                if i % 100 == 0 or i == num_steps -1:
+
+
+                if i%checkpoint_step ==0 or i==num_steps-1:
+                    # checkpoint_path = os.path.join(train_saved_dir, 'model.ckpt')
+                    # saver.save(sess, checkpoint_path, global_step=i)
+
+                    source_test_acc = slip_eval(sess, X, Y, is_train, prok, is_training, label_predictions, source_test,
+                                                slip_size=100)
+                    s_summary = tf.Summary()
+                    s_summary.value.add(tag='label_accuracy', simple_value=source_test_acc)
+                    source_test_writer.add_summary(s_summary, i)
+
+                    target_test_acc = slip_eval(sess, X, Y, is_train, prok, is_training, label_predictions, target_test,
+                                                slip_size=100)
+                    t_summary = tf.Summary()
+                    t_summary.value.add(tag='label_accuracy', simple_value=target_test_acc)
+                    target_test_writer.add_summary(t_summary, i)
                     print("...Step {}".format(i))
-                    print ' ...loss: %f  d_acc: %f  p_acc: %f  p: %f  l: %f  lr: %f' % \
-                          (batch_loss, d_acc, p_acc, p, l, lr)
-                    source_acc = sess.run(acc,
-                                          feed_dict={X: source_test[0], Y: source_test[1],
-                                                     is_train: False, prok: 1.0})
+                    print(" ...dann test: source test {}, target test {}".format(source_test_acc,
+                                                                                        target_test_acc))
 
-                    target_acc, t_summary = sess.run([acc, selected_merged],
-                                          feed_dict={X: target_test[0], Y: target_test[1],
-                                                     is_train: False, prok: 1.0})
-                    test_writer.add_summary(t_summary, i)
-                    print ' ...Source (Young) accuracy:', source_acc
-                    print ' ...Target (Old) accuracy:', target_acc
-
-            elif training_mode == 'source':
-                X_batch, y_batch = gen_source_only_batch.next()
-                _, batch_loss, p_acc, s_summary = sess.run([regular_train_op, loss, acc, selected_merged],
-                                         feed_dict={X: X_batch, Y: y_batch, is_train: False,
-                                                    sigma: l, learning_rate: lr, prok: 0.7})
-                train_writer.add_summary(s_summary, i)
-
-                if i % 100 == 0 or i == num_steps -1:
+                if i % summary_step == 0 or i == num_steps - 1:
                     print("...Step {}".format(i))
-                    print(" .. loss: {}, accuracy: {}".format(batch_loss, p_acc))
-                    source_acc = sess.run(acc, feed_dict={X: source_test[0], Y: source_test[1],is_train: False, prok: 1.0})
-
-                    target_acc, t_summary = sess.run([acc, selected_merged],
-                                                     feed_dict={X: target_test[0], Y: target_test[1],
-                                                                is_train: False, prok: 1.0})
-                    test_writer.add_summary(t_summary, i)
-                    print ' ...Source (Young) accuracy:', source_acc
-                    print ' ...Target (Old) accuracy:', target_acc
-            elif training_mode == 'target':
-                X_batch, y_batch = gen_target_only_batch.next()
-                _, batch_loss = sess.run([regular_train_op, loss],
-                                         feed_dict={X: X_batch, Y: y_batch, is_train: False,
-                                                    sigma: l, learning_rate: lr, prok: 0.7})
-
-        # # Compute final evaluation on test data
-        # source_acc = sess.run(acc,
-        #                       feed_dict={X: source_test[0], Y: source_test[1],
-        #                                  is_train: False, prok: 1.0})
-        #
-        # target_acc = sess.run(acc,
-        #                       feed_dict={X: target_test[0], Y: target_test[1],
-        #                                  is_train: False, prok: 1.0})
-
-        # test_domain_acc = sess.run(domain_acc,
-        #                            feed_dict={model.X: combined_test_imgs,
-        #                                       model.domain: combined_test_domain, model.l: 1.0})
-        #
-        # test_emb = sess.run(model.feature, feed_dict={model.X: combined_test_imgs})
-
-    # return source_acc, target_acc
-
+                    print ' ...dann train loss: %f domain_loss %f, label_loss %f, domain_acc: %f  label_acc: %f' % \
+                          (batch_loss, dloss, lloss, d_acc, l_acc)
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Activity Recognition using Deep Multi-task Learning")
-    parser.add_argument('--mode', type=str, help='source, target, dann')
+    parser = argparse.ArgumentParser(description="domain adaptation")
     parser.add_argument('--version', type=str, help='model version')
     parser.add_argument('--gpu', type=int, default=0, help='assign task to selected gpu')
     args = parser.parse_args()
-    loss, domain_loss, total_loss, acc, domain_acc, regular_train_op, dann_train_op, summaries = build_model()
-    # print '\nSource only training'
-    # source_acc, target_acc = train(loss, domain_loss, total_loss, acc, domain_acc,
-    #                                regular_train_op, dann_train_op, 'source', args.version, args.gpu)
-    # print 'Source (Young) accuracy:', source_acc
-    # print 'Target (Old) accuracy:', target_acc
 
-    print '\nDomain adaptation training'
-    train(loss, domain_loss, total_loss, acc, domain_acc,
-                                   regular_train_op, dann_train_op, summaries, args.mode, args.version, args.gpu)
-    # print 'Source (Young) accuracy:', source_acc
-    # print 'Target (Old) accuracy:', target_acc
-    # print 'Domain accuracy:', d_acc
+    datasets_path = 'datasets'
+    UniMiB_path = os.path.join(datasets_path, 'normalized_UbiMiB.cp')
+    Opportunity_path = os.path.join(datasets_path, 'Opportunity', 'S1S2.cpkl')
+
+
+    Realistics_cross_displacement_path = os.path.join(datasets_path, 'Realistics', 'cross_displacement.cpkl')
+    Realistics_cross_subject_path = os.path.join(datasets_path, 'Realistics', 'cross_subject_target-16.cpkl')
+
+    Realworld_cross_subject_path = os.path.join(datasets_path, 'RealWorld', 'cross_subject_9.cpkl')
+    Realworld_upperarm_forearm_path = os.path.join(datasets_path, 'RealWorld', 'cross_placement_upperarm_forearm.cpkl')
+    Realworld_thigh_shin_path = os.path.join(datasets_path, 'RealWorld', 'cross_placement_thigh_shin.cpkl')
+    Realworld_chest_waist_path = os.path.join(datasets_path, 'RealWorld', 'cross_placement_chest_waist.cpkl')
+
+    Realworld_cross_subject_5_path = data_utils.get_data('RealWorld', 'cross_subject_5')
+    Realworld_forearm_shin_path = data_utils.get_data('RealWorld', 'forearm_to_shin')
+    Realworld_ideal_to_dislocation_path = data_utils.get_data('RealWorld', 'ideal_to_dislocation')
+
+    train(args.version, args.gpu, data_path=Realworld_chest_waist_path)
+

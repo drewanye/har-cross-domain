@@ -97,14 +97,14 @@ def input_batch_norm(x, name='input_norm'):
         y.set_shape(x.get_shape())
         return y
 
-def weight_variable(shape):
-    w = tf.get_variable("weights", shape, initializer=tf.random_normal_initializer(stddev=0.1))
+def weight_variable(shape, name="weights"):
+    w = tf.get_variable(name, shape, initializer=tf.random_normal_initializer(stddev=0.1))
     # w = tf.Variable(tf.random_normal(shape))
     return w
 
-def bias_variable(shape):
+def bias_variable(shape, name="bias"):
     # return tf.Variable(tf.random_normal(shape))
-    return tf.get_variable("bias", shape, initializer=tf.constant_initializer(0.0))
+    return tf.get_variable(name, shape, initializer=tf.constant_initializer(0.0))
 
 def conv2d(x, W, padding):
   return tf.nn.conv2d(x, W, strides=[1, 1, 1, 1], padding=padding)
