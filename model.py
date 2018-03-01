@@ -150,12 +150,6 @@ def label_predictor(features, is_train, Y, prok):
         all_labels = Y
         # source_labels = tf.slice(all_labels, [0, 0], [batch_size/2, -1])
         labels = tf.cond(is_train, lambda: tf.slice(all_labels, [0, 0], [batch_size, -1]), lambda: all_labels)
-        # flatten_features = slim.flatten(features)
-        # with slim.arg_scope([slim.fully_connected], activation_fn=tf.nn.relu):
-        #     f_net1 = slim.fully_connected(flatten_features, 1024, scope='full1')
-        #     f_net2 = slim.fully_connected(f_net1, 128, scope='full2')
-        #     logits = slim.fully_connected(
-        #         f_net2, num_classes, activation_fn=None, scope='fc_logits')
         classifier_features = tf.transpose(classifier_features, [1, 0, 2, 3])  # (135, batch_size, 3, 64)
 
         feat_flat = tf.reshape(classifier_features, [-1, cut_channels * num_filter])
@@ -167,9 +161,6 @@ def label_predictor(features, is_train, Y, prok):
             lstm_cell_2 = tf.contrib.rnn.BasicLSTMCell(num_units_lstm, forget_bias=1.0, state_is_tuple=True)
             cells = tf.contrib.rnn.MultiRNNCell([lstm_cell_1, lstm_cell_2], state_is_tuple=True)
             outputs, _ = tf.contrib.rnn.static_rnn(cells, lstm_inputs, dtype=tf.float32)
-            # with slim.arg_scope([slim.fully_connected], activation_fn=tf.nn.relu):
-            #     f_net1 = slim.fully_connected(outputs[-1], 100, scope='full1')
-            #     f_net2 = slim.fully_connected(f_net1, 100, scope='full2')
 
             logits = slim.fully_connected(
                 outputs[-1], num_classes, activation_fn=None, scope='fc_logits')
@@ -432,7 +423,6 @@ if __name__ == '__main__':
     Realworld_upperarm_forearm_path = os.path.join(datasets_path, 'RealWorld', 'cross_placement_upperarm_forearm.cpkl')
     Realworld_thigh_shin_path = os.path.join(datasets_path, 'RealWorld', 'cross_placement_thigh_shin.cpkl')
     Realworld_chest_waist_path = os.path.join(datasets_path, 'RealWorld', 'cross_placement_chest_waist.cpkl')
-
     Realworld_cross_subject_5_path = data_utils.get_data('RealWorld', 'cross_subject_5')
     Realworld_forearm_shin_path = data_utils.get_data('RealWorld', 'forearm_to_shin')
     Realworld_ideal_to_dislocation_path = data_utils.get_data('RealWorld', 'ideal_to_dislocation')
